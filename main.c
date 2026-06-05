@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -43,12 +44,17 @@ static int set_nonblocking(int fd) {
   return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-/* ---- Write ring buffer (lock-free SPSC) ---- */
+/* ---- Write ring buffer ----
+   All access (append by producers, drain by the consumer) is serialized by
+   state.conns_lock. There are two producers — the main kqueue loop and the
+   vmnet host_queue — so this is NOT a valid single-producer lock-free buffer;
+   correctness comes from the mutex. The atomic indices are retained as a
+   low-cost belt-and-suspenders and to document head/tail ownership. */
 
 struct write_buf {
   uint8_t *data;
-  _Atomic size_t head; /* consumer (kqueue thread) reads from here */
-  _Atomic size_t tail; /* producer (host_queue or kqueue) writes here */
+  _Atomic size_t head; /* advanced by the consumer (drain) */
+  _Atomic size_t tail; /* advanced by producers (broadcast) */
   size_t capacity;
 };
 
@@ -182,6 +188,12 @@ struct state {
   uint64_t max_packet_size;
   struct conn conns[MAX_CONNECTIONS];
   int conn_count;
+  /* Serializes ALL access to conns[] and every per-connection write_buf.
+     Two threads touch this state: the main kqueue loop (accept / VM-socket
+     read + drain) and the vmnet host_queue (RX broadcast). Held by the call
+     sites in main() and _on_vmnet_packets_available(); broadcast_packet(),
+     close_connection(), conn_alloc() and conn_free() assume it is held. */
+  pthread_mutex_t conns_lock;
 };
 
 /* Find a free connection slot. Returns slot index or -1. */
@@ -500,10 +512,12 @@ static void _on_vmnet_packets_available(interface_ref iface, int64_t buf_count, 
   DEBUGF("Received from VMNET: %d packets (buffer was prepared for %lld packets)", received_count,
          buf_count);
 
+  pthread_mutex_lock(&state->conns_lock);
   for (int i = 0; i < received_count; i++) {
     uint32_t header_be = htonl(pdv[i].vm_pkt_size);
     broadcast_packet(state, -1, &header_be, 4, pdv[i].vm_pkt_iov[0].iov_base, pdv[i].vm_pkt_size);
   }
+  pthread_mutex_unlock(&state->conns_lock);
 
 done:
   if (pdv != NULL) {
@@ -740,6 +754,7 @@ int main(int argc, char *argv[]) {
   __block interface_ref iface = NULL;
 
   struct state state = {0};
+  pthread_mutex_init(&state.conns_lock, NULL);
 
   struct cli_options *cliopt = cli_options_parse(argc, argv);
   assert(cliopt != NULL);
@@ -822,18 +837,24 @@ int main(int argc, char *argv[]) {
               ERRORN("accept");
               break;
             }
+            pthread_mutex_lock(&state.conns_lock);
             handle_new_connection(&state, fd);
+            pthread_mutex_unlock(&state.conns_lock);
           }
         } else {
           /* Data available on a VM socket */
           int slot = (int)(intptr_t)ev->udata;
+          pthread_mutex_lock(&state.conns_lock);
           handle_vm_readable(&state, slot);
+          pthread_mutex_unlock(&state.conns_lock);
         }
       }
 
       if (ev->filter == EVFILT_WRITE) {
         int slot = (int)(intptr_t)ev->udata;
+        pthread_mutex_lock(&state.conns_lock);
         handle_vm_writable(&state, slot);
+        pthread_mutex_unlock(&state.conns_lock);
       }
     }
   }
@@ -844,10 +865,12 @@ done:
   DEBUGF("shutting down with rc=%d", rc);
 
   /* Close all active connections */
+  pthread_mutex_lock(&state.conns_lock);
   for (int i = 0; i < MAX_CONNECTIONS; i++) {
     if (state.conns[i].active)
       close_connection(&state, i);
   }
+  pthread_mutex_unlock(&state.conns_lock);
 
   if (iface != NULL) {
     stop(&state, iface);
@@ -864,6 +887,7 @@ done:
   if (kq != -1) {
     close(kq);
   }
+  pthread_mutex_destroy(&state.conns_lock);
   cli_options_destroy(cliopt);
   return rc;
 }
