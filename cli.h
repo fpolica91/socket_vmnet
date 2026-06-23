@@ -26,8 +26,8 @@ struct cli_options {
   char *vmnet_nat66_prefix;
   // -p, --pidfile; writes pidfile using permissions of socket_vmnet
   char *pidfile;
-  // arg
-  char *socket_path;
+  char **socket_paths;
+  int num_sockets;
 };
 
 struct cli_options *cli_options_parse(int argc, char *argv[]);

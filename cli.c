@@ -168,10 +168,14 @@ struct cli_options *cli_options_parse(int argc, char *argv[]) {
       break;
     }
   }
-  if (argc - optind != 1) {
+  if (argc - optind < 1) {
     goto error;
   }
-  res->socket_path = strdup(argv[optind]);
+  res->num_sockets = argc - optind;
+  res->socket_paths = calloc(res->num_sockets, sizeof(char *));
+  for (int i = 0; i < res->num_sockets; i++) {
+    res->socket_paths[i] = strdup(argv[optind + i]);
+  }
 
   /* fill default */
   if (res->socket_group == NULL)
@@ -242,7 +246,10 @@ void cli_options_destroy(struct cli_options *x) {
   if (x == NULL)
     return;
   free(x->socket_group);
-  free(x->socket_path);
+  for (int i = 0; i < x->num_sockets; i++) {
+    free(x->socket_paths[i]);
+  }
+  free(x->socket_paths);
   free(x->vmnet_interface);
   free(x->vmnet_gateway);
   free(x->vmnet_dhcp_end);

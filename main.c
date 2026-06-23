@@ -13,6 +13,7 @@
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <vmnet/vmnet.h>
 
 #include "cli.h"
@@ -222,30 +223,41 @@ static void on_vmnet_packets_available(interface_ref iface, int64_t estim_count,
     _on_vmnet_packets_available(iface, r, max_bytes, state);
 }
 
-static interface_ref start(struct state *state, struct cli_options *cliopt) {
-  INFOF("Initializing vmnet.framework (mode %d)", cliopt->vmnet_mode);
-  xpc_object_t dict = xpc_dictionary_create(NULL, NULL, 0);
-  xpc_dictionary_set_uint64(dict, vmnet_operation_mode_key, cliopt->vmnet_mode);
+static vmnet_network_ref create_shared_network(struct cli_options *cliopt) {
+  INFOF("Initializing vmnet.framework (mode %d, DHCP disabled)", cliopt->vmnet_mode);
+  if (cliopt->vmnet_gateway == NULL) {
+    ERROR("--vmnet-gateway is required");
+    return NULL;
+  }
+  vmnet_return_t st;
+  vmnet_network_configuration_ref cfg = vmnet_network_configuration_create(cliopt->vmnet_mode, &st);
+  if (cfg == NULL) {
+    ERRORF("vmnet_network_configuration_create: [%d] %s", st, vmnet_strerror(st));
+    return NULL;
+  }
+  struct in_addr subnet, mask;
+  inet_aton(cliopt->vmnet_gateway, &subnet);
+  inet_aton(cliopt->vmnet_mask, &mask);
+  vmnet_network_configuration_set_ipv4_subnet(cfg, &subnet, &mask);
+  vmnet_network_configuration_disable_dhcp(cfg);
   if (cliopt->vmnet_interface != NULL) {
-    INFOF("Using network interface \"%s\"", cliopt->vmnet_interface);
-    xpc_dictionary_set_string(dict, vmnet_shared_interface_name_key, cliopt->vmnet_interface);
+    INFOF("Using external interface \"%s\"", cliopt->vmnet_interface);
+    st = vmnet_network_configuration_set_external_interface(cfg, cliopt->vmnet_interface);
+    if (st != VMNET_SUCCESS) {
+      ERRORF("vmnet_network_configuration_set_external_interface: [%d] %s", st, vmnet_strerror(st));
+      return NULL;
+    }
   }
-
-  if (!uuid_is_null(cliopt->vmnet_network_identifier)) {
-    xpc_dictionary_set_uuid(dict, vmnet_network_identifier_key, cliopt->vmnet_network_identifier);
+  vmnet_network_ref net = vmnet_network_create(cfg, &st);
+  if (net == NULL) {
+    ERRORF("vmnet_network_create: [%d] %s", st, vmnet_strerror(st));
+    return NULL;
   }
+  return net;
+}
 
-  if (cliopt->vmnet_gateway != NULL) {
-    xpc_dictionary_set_string(dict, vmnet_start_address_key, cliopt->vmnet_gateway);
-    xpc_dictionary_set_string(dict, vmnet_end_address_key, cliopt->vmnet_dhcp_end);
-    xpc_dictionary_set_string(dict, vmnet_subnet_mask_key, cliopt->vmnet_mask);
-  }
-
-  xpc_dictionary_set_uuid(dict, vmnet_interface_id_key, cliopt->vmnet_interface_id);
-
-  if (cliopt->vmnet_nat66_prefix != NULL) {
-    xpc_dictionary_set_string(dict, vmnet_nat66_prefix_key, cliopt->vmnet_nat66_prefix);
-  }
+static interface_ref start_interface(struct state *state, vmnet_network_ref net) {
+  xpc_object_t dict = xpc_dictionary_create(NULL, NULL, 0);
 
   dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 
@@ -253,8 +265,8 @@ static interface_ref start(struct state *state, struct cli_options *cliopt) {
   __block vmnet_return_t status;
 
   __block uint64_t max_bytes = 0;
-  iface = vmnet_start_interface(
-      dict, state->host_queue, ^(vmnet_return_t x_status, xpc_object_t x_param) {
+  iface = vmnet_interface_start_with_network(
+      net, dict, state->host_queue, ^(vmnet_return_t x_status, xpc_object_t x_param) {
         status = x_status;
         if (x_status == VMNET_SUCCESS) {
           print_vmnet_start_param(x_param);
@@ -265,7 +277,7 @@ static interface_ref start(struct state *state, struct cli_options *cliopt) {
   dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
   xpc_release(dict);
   if (status != VMNET_SUCCESS) {
-    ERRORF("vmnet_start_interface: [%d] %s", status, vmnet_strerror(status));
+    ERRORF("vmnet_interface_start_with_network: [%d] %s", status, vmnet_strerror(status));
     return NULL;
   }
 
@@ -382,27 +394,26 @@ static int create_pidfile(const char *pidfile) {
   return fd;
 }
 
-static int setup_signals(int kq) {
+static int block_signals(void) {
+  sigset_t mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGHUP);
+  sigaddset(&mask, SIGINT);
+  sigaddset(&mask, SIGTERM);
+  if (sigprocmask(SIG_BLOCK, &mask, NULL) != 0) {
+    ERRORN("sigprocmask");
+    return -1;
+  }
+  signal(SIGPIPE, SIG_IGN);
+  return 0;
+}
+
+static int register_signal_kevents(int kq) {
   struct kevent changes[] = {
       {.ident = SIGHUP,  .filter = EVFILT_SIGNAL, .flags = EV_ADD},
       {.ident = SIGINT,  .filter = EVFILT_SIGNAL, .flags = EV_ADD},
       {.ident = SIGTERM, .filter = EVFILT_SIGNAL, .flags = EV_ADD},
   };
-
-  // Block signals we want to receive via kqueue.
-  sigset_t mask;
-  sigemptyset(&mask);
-  for (size_t i = 0; i < ARRAY_SIZE(changes); i++) {
-    sigaddset(&mask, changes[i].ident);
-  }
-  if (sigprocmask(SIG_BLOCK, &mask, NULL) != 0) {
-    ERRORN("sigprocmask");
-    return -1;
-  }
-
-  // We will receive EPIPE on the socket.
-  signal(SIGPIPE, SIG_IGN);
-
   if (kevent(kq, changes, ARRAY_SIZE(changes), NULL, 0, NULL) != 0) {
     ERRORN("kevent");
     return -1;
@@ -423,24 +434,21 @@ static int add_listen_fd(int kq, int fd) {
 
 static void on_accept(struct state *state, int accept_fd, interface_ref iface);
 
-int main(int argc, char *argv[]) {
-  debug = getenv("DEBUG") != NULL;
-  int rc = 1;
+struct worker_args {
+  struct cli_options *cliopt;
+  vmnet_network_ref net;
+  const char *socket_path;
+};
+
+static void *run_interface(void *argp) {
+  struct worker_args *wa = argp;
+  struct cli_options *cliopt = wa->cliopt;
+  const char *socket_path = wa->socket_path;
   int listen_fd = -1;
-  int pidfile_fd = -1;
   int kq = -1;
   __block interface_ref iface = NULL;
 
   struct state state = {0};
-
-  struct cli_options *cliopt = cli_options_parse(argc, argv);
-  assert(cliopt != NULL);
-  if (geteuid() != 0) {
-    WARN("Running without root. This is very unlikely to work: See README.md");
-  }
-  if (geteuid() != getuid()) {
-    WARN("Seems running with SETUID. This is insecure and highly discouraged: See README.md");
-  }
 
   kq = kqueue();
   if (kq == -1) {
@@ -448,22 +456,12 @@ int main(int argc, char *argv[]) {
     goto done;
   }
 
-  // Setup signals beofre creating the pidfile to ensure removal of the pidfile
-  // when terminating by signal.
-  if (setup_signals(kq)) {
+  if (register_signal_kevents(kq)) {
     goto done;
   }
 
-  if (cliopt->pidfile != NULL) {
-    pidfile_fd = create_pidfile(cliopt->pidfile);
-    if (pidfile_fd == -1) {
-      goto done; // error already logged.
-    }
-  }
-
-  DEBUGF("Opening socket \"%s\" (for UNIX group \"%s\")", cliopt->socket_path,
-         cliopt->socket_group);
-  listen_fd = socket_bindlisten(cliopt->socket_path, cliopt->socket_group);
+  DEBUGF("Opening socket \"%s\" (for UNIX group \"%s\")", socket_path, cliopt->socket_group);
+  listen_fd = socket_bindlisten(socket_path, cliopt->socket_group);
   if (listen_fd < 0) {
     ERRORN("socket_bindlisten");
     goto done;
@@ -471,17 +469,14 @@ int main(int argc, char *argv[]) {
 
   state.sem = dispatch_semaphore_create(1);
 
-  // Queue for vm connections, allowing processing vms requests in parallel.
   state.vms_queue =
       dispatch_queue_create("io.github.lima-vm.socket_vmnet.vms", DISPATCH_QUEUE_CONCURRENT);
 
-  // Queue for processing vmnet events.
   state.host_queue =
       dispatch_queue_create("io.github.lima-vm.socket_vmnet.host", DISPATCH_QUEUE_SERIAL);
 
-  iface = start(&state, cliopt);
+  iface = start_interface(&state, wa->net);
   if (iface == NULL) {
-    // Error already logged.
     goto done;
   }
 
@@ -514,18 +509,12 @@ int main(int argc, char *argv[]) {
       });
     }
   }
-  rc = 0;
 done:
-  DEBUGF("shutting down with rc=%d", rc);
   if (iface != NULL) {
     stop(&state, iface);
   }
   if (listen_fd != -1) {
     close(listen_fd);
-  }
-  if (pidfile_fd != -1) {
-    remove_pidfile(cliopt->pidfile);
-    close(pidfile_fd);
   }
   if (state.vms_queue != NULL)
     dispatch_release(state.vms_queue);
@@ -534,8 +523,67 @@ done:
   if (kq != -1) {
     close(kq);
   }
+  return NULL;
+}
+
+int main(int argc, char *argv[]) {
+  debug = getenv("DEBUG") != NULL;
+
+  struct cli_options *cliopt = cli_options_parse(argc, argv);
+  assert(cliopt != NULL);
+  if (geteuid() != 0) {
+    WARN("Running without root. This is very unlikely to work: See README.md");
+  }
+  if (geteuid() != getuid()) {
+    WARN("Seems running with SETUID. This is insecure and highly discouraged: See README.md");
+  }
+
+  if (block_signals()) {
+    cli_options_destroy(cliopt);
+    return 1;
+  }
+
+  vmnet_network_ref net = create_shared_network(cliopt);
+  if (net == NULL) {
+    cli_options_destroy(cliopt);
+    return 1;
+  }
+
+  int pidfile_fd = -1;
+  if (cliopt->pidfile != NULL) {
+    pidfile_fd = create_pidfile(cliopt->pidfile);
+    if (pidfile_fd == -1) {
+      cli_options_destroy(cliopt);
+      return 1;
+    }
+  }
+
+  int n = cliopt->num_sockets;
+  pthread_t *threads = calloc(n, sizeof(pthread_t));
+  struct worker_args *args = calloc(n, sizeof(struct worker_args));
+  for (int i = 0; i < n; i++) {
+    args[i].cliopt = cliopt;
+    args[i].net = net;
+    args[i].socket_path = cliopt->socket_paths[i];
+    if (pthread_create(&threads[i], NULL, run_interface, &args[i]) != 0) {
+      ERRORN("pthread_create");
+      threads[i] = 0;
+    }
+  }
+  for (int i = 0; i < n; i++) {
+    if (threads[i] != 0) {
+      pthread_join(threads[i], NULL);
+    }
+  }
+
+  if (pidfile_fd != -1) {
+    remove_pidfile(cliopt->pidfile);
+    close(pidfile_fd);
+  }
+  free(threads);
+  free(args);
   cli_options_destroy(cliopt);
-  return rc;
+  return 0;
 }
 
 static void on_accept(struct state *state, int accept_fd, interface_ref iface) {
